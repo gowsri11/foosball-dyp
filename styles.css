@@ -2402,6 +2402,152 @@ button svg {
   }
 }
 
+/* Sign-in controls in the header */
+.auth-slot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.auth-slot:empty {
+  display: none;
+}
+
+.auth-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.auth-user {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 180px;
+}
+
+.auth-avatar {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.auth-name {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Who can enter scores */
+.access-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  margin-bottom: 22px;
+  padding: 12px 16px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.access-bar strong {
+  color: var(--text);
+}
+
+.access-bar.is-owner {
+  border-color: rgba(215, 255, 95, 0.18);
+}
+
+.access-bar.is-locked {
+  color: var(--orange);
+  border-color: rgba(255, 171, 107, 0.22);
+}
+
+.access-text {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.access-text svg {
+  width: 15px;
+  height: 15px;
+}
+
+.access-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.access-toggle > span {
+  color: var(--muted-2);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.segmented.compact {
+  grid-template-columns: auto auto;
+  height: 38px;
+}
+
+.segmented.compact button {
+  padding: 0 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.segmented.compact button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.segmented.compact button.is-active {
+  color: var(--lime-ink);
+  background: var(--lime);
+}
+
+.final-label.is-waiting {
+  color: var(--muted);
+}
+
+.recent-head.is-spaced {
+  margin-top: 18px;
+}
+
+@media (max-width: 700px) {
+  .auth-name,
+  .auth-button span {
+    display: none;
+  }
+
+  .auth-button {
+    width: 38px;
+    padding: 0;
+  }
+}
+
 .busy-overlay {
   position: fixed;
   inset: 0;

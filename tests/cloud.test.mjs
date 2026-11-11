@@ -103,7 +103,7 @@ test("publishable keys go only in the apikey header", async () => {
 test("legacy anon JWT keys are also sent as a bearer token", async () => {
   const { calls, fetchImpl } = mockFetch([{ status: 200, body: [] }]);
   const client = createCloudClient({ url: "https://x.supabase.co", key: "eyJhbGciOi" }, fetchImpl);
-  await client.listTournaments();
+  await client.listTournamentsById(["AbCdEf1234"]);
   assert.equal(calls[0].init.headers.Authorization, "Bearer eyJhbGciOi");
 });
 
@@ -137,7 +137,7 @@ test("redraw only succeeds against the expected draw version", async () => {
 test("server errors surface status and message", async () => {
   const { fetchImpl } = mockFetch([{ status: 401, body: { message: "Invalid API key" } }]);
   const client = createCloudClient({ url: "https://x.supabase.co", key: "k" }, fetchImpl);
-  await assert.rejects(client.listTournaments(), (error) => {
+  await assert.rejects(client.listTournamentsById(["AbCdEf1234"]), (error) => {
     assert.equal(error.status, 401);
     assert.equal(error.message, "Invalid API key");
     return true;
@@ -187,18 +187,91 @@ test("drops results with out-of-range or non-numeric scores", () => {
   assert.equal(fromTournamentRow(row).rounds[0].games[0].scoreA, null);
 });
 
-test("recent list keeps only safe fields", async () => {
-  const fetchImpl = async () =>
-    new Response(
+test("recently opened list keeps only safe fields and asks only for known ids", async () => {
+  let requested = "";
+  const fetchImpl = async (url) => {
+    requested = url;
+    return new Response(
       JSON.stringify([
         { id: "bad id<>", name: "x", games_per_player: 4, created_at: "2026-11-11T10:00:00Z", players: [] },
         { id: "AbCdEf1234", name: "Ok", games_per_player: 4, created_at: "2026-11-11T10:00:00Z", players: [1, 2, 3, 4], extra: "<x>" }
       ]),
       { status: 200 }
     );
+  };
   const client = createCloudClient({ url: "https://x.supabase.co", key: "k" }, fetchImpl);
-  const rows = await client.listTournaments();
+  const rows = await client.listTournamentsById(["AbCdEf1234", "../evil", "x)or(1"]);
+  assert.match(requested, /id=in\.\(AbCdEf1234\)&/);
   assert.deepEqual(rows, [
     { id: "AbCdEf1234", name: "Ok", created_at: "2026-11-11T10:00:00Z", games_per_player: 4, playerCount: 4 }
   ]);
+});
+
+test("signed-in requests send the user's token, not the key, as bearer", async () => {
+  const { calls, fetchImpl } = mockFetch([{ status: 200, body: [] }, { status: 200, body: [] }]);
+  let token = "user-jwt";
+  const client = createCloudClient(
+    { url: "https://x.supabase.co", key: "sb_publishable_abc" },
+    fetchImpl,
+    async () => token
+  );
+  await client.fetchTournament("AbCdEf1234");
+  assert.equal(calls[0].init.headers.Authorization, "Bearer user-jwt");
+  assert.equal(calls[0].init.headers.apikey, "sb_publishable_abc");
+  token = null;
+  await client.fetchTournament("AbCdEf1234");
+  assert.equal(calls[1].init.headers.Authorization, undefined);
+});
+
+test("create returns the owner the server assigned", async () => {
+  const row = { ...validRow(), owner_id: "11111111-1111-1111-1111-111111111111", owner_name: "Alice", edit_mode: "owner" };
+  const { calls, fetchImpl } = mockFetch([{ status: 201, body: [row] }]);
+  const client = createCloudClient({ url: "https://x.supabase.co", key: "k" }, fetchImpl, async () => "t");
+  const created = await client.createTournament({
+    ...sampleTournament,
+    rounds: row.rounds,
+    editMode: "owner"
+  });
+  const sent = JSON.parse(calls[0].init.body);
+  assert.equal(sent.edit_mode, "owner");
+  assert.equal("owner_id" in sent, false);
+  assert.equal(created.ownerId, row.owner_id);
+  assert.equal(created.ownerName, "Alice");
+  assert.equal(created.editMode, "owner");
+});
+
+test("guest tournaments always read as editable by anyone", () => {
+  const row = { ...validRow(), owner_id: null, owner_name: "spoof", edit_mode: "owner" };
+  const tournament = fromTournamentRow(row);
+  assert.equal(tournament.ownerId, null);
+  assert.equal(tournament.ownerName, null);
+  assert.equal(tournament.editMode, "anyone");
+});
+
+test("rejects malformed owner fields", () => {
+  for (const patch of [{ owner_id: "not-a-uuid" }, { edit_mode: "everyone" }, { owner_name: 5, owner_id: "11111111-1111-1111-1111-111111111111" }]) {
+    assert.throws(() => fromTournamentRow({ ...validRow(), ...patch }), /invalid/);
+  }
+});
+
+test("owned list ignores a non-uuid owner id", async () => {
+  const { calls, fetchImpl } = mockFetch([]);
+  const client = createCloudClient({ url: "https://x.supabase.co", key: "k" }, fetchImpl);
+  assert.deepEqual(await client.listOwnedTournaments("x)or(1"), []);
+  assert.equal(calls.length, 0);
+});
+
+test("edit mode change reports whether the server allowed it", async () => {
+  const { calls, fetchImpl } = mockFetch([{ status: 200, body: [{}] }, { status: 200, body: [] }]);
+  const client = createCloudClient({ url: "https://x.supabase.co", key: "k" }, fetchImpl);
+  assert.equal(await client.setEditMode("AbCdEf1234", "anyone"), true);
+  assert.deepEqual(JSON.parse(calls[0].init.body), { edit_mode: "anyone" });
+  assert.equal(await client.setEditMode("AbCdEf1234", "owner"), false);
+});
+
+test("signature changes when the edit mode changes", () => {
+  const copy = structuredClone(sampleTournament);
+  const before = tournamentSignature(copy);
+  copy.editMode = "owner";
+  assert.notEqual(tournamentSignature(copy), before);
 });

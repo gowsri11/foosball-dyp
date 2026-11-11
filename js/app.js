@@ -15,11 +15,22 @@ import {
   loadCloudConfig,
   tournamentSignature
 } from "./cloud.js";
+import {
+  currentUser,
+  getAccessToken,
+  initAuth,
+  onUserChange,
+  signInWithGoogle,
+  signOut,
+  takeSavedDraft
+} from "./auth.js";
 
 const STORAGE_KEY = "foosball-dyp.v1";
 const LOCAL_BACKUP_KEY = "foosball-dyp.v1.local-backup";
 const POLL_INTERVAL_MS = 4000;
 const SHARE_ID_PATTERN = /^[A-Za-z0-9]{8,24}$/;
+const HISTORY_KEY = "foosball-dyp.v1.history";
+const HISTORY_LIMIT = 12;
 const MAX_PLAYERS = 40;
 const MAX_GAMES_PER_PLAYER = 20;
 
@@ -38,6 +49,8 @@ let ui = {
 // Live sync with Supabase. `cloud` stays null when /api/config has no keys,
 // and the app then works exactly as before, saving to this browser only.
 let cloud = null;
+let user = null;
+let authAvailable = false;
 const sync = {
   status: "local",
   timer: null,
@@ -97,6 +110,20 @@ const icons = {
     <svg viewBox="0 0 20 20" aria-hidden="true">
       <path d="M10 3v9M6.5 8.5 10 12l3.5-3.5M4 15.5h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>`,
+  google: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="#4285F4" d="M21.6 12.23c0-.71-.06-1.4-.18-2.05H12v3.88h5.38a4.6 4.6 0 0 1-2 3.02v2.5h3.24c1.9-1.75 2.98-4.32 2.98-7.35z"/>
+      <path fill="#34A853" d="M12 22c2.7 0 4.96-.9 6.62-2.42l-3.24-2.5c-.9.6-2.04.96-3.38.96-2.6 0-4.8-1.76-5.59-4.12H3.07v2.58A10 10 0 0 0 12 22z"/>
+      <path fill="#FBBC05" d="M6.41 13.92a6 6 0 0 1 0-3.84V7.5H3.07a10 10 0 0 0 0 9z"/>
+      <path fill="#EA4335" d="M12 5.96c1.47 0 2.79.5 3.83 1.5l2.87-2.87A9.62 9.62 0 0 0 12 2a10 10 0 0 0-8.93 5.5l3.34 2.58C7.2 7.72 9.4 5.96 12 5.96z"/>
+    </svg>
+  `,
+  lock: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="5" y="10.5" width="14" height="9.5" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/>
+      <path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5" fill="none" stroke="currentColor" stroke-width="1.7"/>
+    </svg>
+  `,
   link: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -149,7 +176,7 @@ function icon(name) {
 boot();
 
 function renderSetup() {
-  const draft = ui.setupDraft || {
+  const draft = sanitizeDraft(ui.setupDraft) || {
     name: "",
     players: "",
     games: 4,
@@ -163,10 +190,11 @@ function renderSetup() {
         ${brandMarkup()}
         <div class="header-actions">
           <span class="header-note">2v2 · Individual scoring</span>
-          <button class="button ghost" type="button" data-action="show-rules" aria-label="How it works">
+          <button class="button ghost header-secondary" type="button" data-action="show-rules" aria-label="How it works">
             ${icon("info")}
             <span>How it works</span>
           </button>
+          <span id="auth-slot" class="auth-slot">${authControlMarkup()}</span>
         </div>
       </header>
 
@@ -302,9 +330,203 @@ function renderSetup() {
 }
 
 function setupFootnote() {
-  return cloud
-    ? "Saved online. Share the link so anyone can follow along and enter scores."
-    : "Your tournament stays in this browser. No account needed.";
+  if (!cloud) {
+    return "Your tournament stays in this browser. No account needed.";
+  }
+  if (user) {
+    return `You will own this tournament. Only you can redraw, and you choose who can enter scores.`;
+  }
+  return authAvailable
+    ? "Guest tournament: anyone with the link can enter scores and redraw. Sign in to own it."
+    : "Saved online. Share the link so anyone can follow along and enter scores.";
+}
+
+function sanitizeDraft(draft) {
+  if (!draft || typeof draft !== "object") {
+    return null;
+  }
+  const games = Math.floor(Number(draft.games));
+  return {
+    name: typeof draft.name === "string" ? draft.name.slice(0, 48) : "",
+    players: typeof draft.players === "string" ? draft.players.slice(0, 4000) : "",
+    games: Number.isFinite(games) ? clamp(games, 1, MAX_GAMES_PER_PLAYER) : 4,
+    target: Number(draft.target) === 10 ? 10 : 7
+  };
+}
+
+function readSetupDraftFromPage() {
+  const form = document.querySelector("#setup-form");
+  if (!form) {
+    return null;
+  }
+  return {
+    name: form.querySelector('[name="name"]').value,
+    players: form.querySelector('[name="players"]').value,
+    games: form.querySelector('[name="games"]').value,
+    target: form.querySelector('input[name="target"]:checked')?.value || 7
+  };
+}
+
+// ---- Sign-in and permissions ---------------------------------------------
+
+function authControlMarkup() {
+  if (!authAvailable) {
+    return "";
+  }
+  if (!user) {
+    return `
+      <button class="button ghost compact auth-button" type="button" data-action="sign-in">
+        ${icon("google")}
+        <span>Sign in</span>
+      </button>
+    `;
+  }
+  const avatar = user.avatarUrl
+    ? `<img class="auth-avatar" src="${escapeHtml(user.avatarUrl)}" alt="" referrerpolicy="no-referrer" />`
+    : `<span class="avatar small" style="--avatar-hue: ${hueForName(user.name)}" aria-hidden="true">${escapeHtml(initialsForName(user.name))}</span>`;
+  return `
+    <span class="auth-user" title="${escapeHtml(user.email)}">
+      ${avatar}
+      <span class="auth-name">${escapeHtml(user.name)}</span>
+    </span>
+    <button class="button text compact" type="button" data-action="sign-out">Sign out</button>
+  `;
+}
+
+function isOwner(current = tournament) {
+  return Boolean(current?.ownerId && user && current.ownerId === user.id);
+}
+
+function canScore(current = tournament) {
+  if (!current?.cloud || !current.ownerId) {
+    return true;
+  }
+  return current.editMode === "anyone" || isOwner(current);
+}
+
+function canRedraw(current = tournament) {
+  if (!current?.cloud || !current.ownerId) {
+    return true;
+  }
+  return isOwner(current);
+}
+
+function accessBarMarkup() {
+  if (!tournament?.cloud) {
+    return "";
+  }
+  if (!tournament.ownerId) {
+    return `
+      <div class="access-bar">
+        <span class="access-text">
+          <strong>Guest tournament.</strong> Anyone with the link can enter scores and redraw.
+        </span>
+      </div>
+    `;
+  }
+  const ownerName = escapeHtml(tournament.ownerName || "the owner");
+  if (isOwner()) {
+    const mode = tournament.editMode;
+    return `
+      <div class="access-bar is-owner">
+        <span class="access-text">
+          <strong>You own this tournament.</strong> Only you can redraw.
+        </span>
+        <div class="access-toggle">
+          <span>Who can enter scores</span>
+          <div class="segmented compact" role="group" aria-label="Who can enter scores">
+            <button type="button" data-action="set-edit-mode" data-mode="owner" aria-pressed="${mode === "owner"}" class="${mode === "owner" ? "is-active" : ""}">Only me</button>
+            <button type="button" data-action="set-edit-mode" data-mode="anyone" aria-pressed="${mode === "anyone"}" class="${mode === "anyone" ? "is-active" : ""}">Anyone with the link</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  return `
+    <div class="access-bar ${tournament.editMode === "owner" ? "is-locked" : ""}">
+      <span class="access-text">
+        ${
+          tournament.editMode === "owner"
+            ? `${icon("lock")} <strong>View only.</strong> ${ownerName} is entering the scores.${user ? "" : " Following live."}`
+            : `<strong>Run by ${ownerName}.</strong> Anyone with the link can enter scores.`
+        }
+      </span>
+    </div>
+  `;
+}
+
+async function changeEditMode(mode) {
+  if (!tournament?.cloud || !isOwner() || !cloud || tournament.editMode === mode) {
+    return;
+  }
+  const previous = tournament.editMode;
+  tournament.editMode = mode;
+  renderTournament();
+  try {
+    const changed = await cloud.setEditMode(tournament.id, mode);
+    if (!changed) {
+      throw new Error("not allowed");
+    }
+    persistTournament();
+    showToast(
+      mode === "owner"
+        ? "Only you can enter scores now."
+        : "Anyone with the link can enter scores now."
+    );
+  } catch {
+    tournament.editMode = previous;
+    renderTournament();
+    showToast("Could not change who can enter scores. Try again.", "error");
+  }
+}
+
+async function startSignIn() {
+  try {
+    await signInWithGoogle(readSetupDraftFromPage());
+  } catch {
+    showToast("Could not start sign-in. Try again.", "error");
+  }
+}
+
+async function handleSignOut() {
+  try {
+    await signOut();
+  } catch {
+    // the session is cleared locally either way
+  }
+  showToast("Signed out.");
+}
+
+function handleUserChange(nextUser) {
+  user = nextUser;
+  if (tournament) {
+    ui.editingGameId = canScore() ? ui.editingGameId : null;
+    renderTournament();
+  } else {
+    ui.setupDraft = readSetupDraftFromPage() || ui.setupDraft;
+    renderSetup();
+  }
+}
+
+function rememberTournament(id) {
+  try {
+    const list = readHistory().filter((item) => item !== id);
+    list.unshift(id);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_LIMIT)));
+  } catch {
+    // storage blocked; history is a convenience only
+  }
+}
+
+function readHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((id) => typeof id === "string" && SHARE_ID_PATTERN.test(id))
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function renderLoading(message) {
@@ -361,6 +583,7 @@ function renderTournament() {
           <button class="button primary compact" type="button" data-action="new-tournament">
             New tournament
           </button>
+          <span id="auth-slot" class="auth-slot">${authControlMarkup()}</span>
         </div>
       </header>
 
@@ -386,6 +609,8 @@ function renderTournament() {
 
           ${progressPanelMarkup(progress)}
         </section>
+
+        ${accessBarMarkup()}
 
         ${champion ? championMarkup(champion) : ""}
 
@@ -455,10 +680,14 @@ function renderTournament() {
               }
             </p>
           </div>
-          <button class="button ghost compact" type="button" data-action="regenerate">
-            ${icon("reset")}
-            <span>Regenerate draw</span>
-          </button>
+          ${
+            canRedraw()
+              ? `<button class="button ghost compact" type="button" data-action="regenerate">
+                  ${icon("reset")}
+                  <span>Regenerate draw</span>
+                </button>`
+              : ""
+          }
         </footer>
       </main>
     </div>
@@ -621,7 +850,8 @@ function gameCardMarkup(game, index, round) {
         ? "A"
         : "B"
       : null;
-  const showInputs = !complete || editing;
+  const allowed = canScore();
+  const showInputs = allowed && (!complete || editing);
 
   return `
     <article
@@ -657,10 +887,18 @@ function gameCardMarkup(game, index, round) {
           `
           : `
             <footer class="game-footer">
-              <span class="final-label">${icon("check")} Result saved</span>
-              <button class="button text compact" type="button" data-action="edit-game">
-                ${icon("edit")} Edit score
-              </button>
+              ${
+                complete
+                  ? `<span class="final-label">${icon("check")} Result saved</span>`
+                  : `<span class="final-label is-waiting">${icon("lock")} Waiting for ${escapeHtml(tournament.ownerName || "the owner")}</span>`
+              }
+              ${
+                allowed
+                  ? `<button class="button text compact" type="button" data-action="edit-game">
+                      ${icon("edit")} Edit score
+                    </button>`
+                  : ""
+              }
             </footer>
           `
       }
@@ -1035,12 +1273,28 @@ function handleSetupSubmit(event) {
         updatedAt: now
       };
       let savedOnline = false;
+      let created = draft;
 
       if (cloud) {
         try {
-          await cloud.createTournament(draft);
-          draft.cloud = true;
+          // Signed-in users own what they create. Scores start owner-only;
+          // the owner can open them up from the tournament page.
+          const stored = await cloud.createTournament({
+            ...draft,
+            editMode: user ? "owner" : undefined
+          });
+          // Keep the locally generated draw, take ownership fields from the server.
+          created = {
+            ...draft,
+            cloud: true,
+            ownerId: stored.ownerId,
+            ownerName: stored.ownerName,
+            editMode: stored.editMode,
+            createdAt: stored.createdAt || draft.createdAt,
+            updatedAt: stored.updatedAt || draft.updatedAt
+          };
           savedOnline = true;
+          rememberTournament(created.id);
         } catch (cloudError) {
           showToast(
             "Could not reach the server. This tournament is saved on this device only.",
@@ -1049,7 +1303,7 @@ function handleSetupSubmit(event) {
         }
       }
 
-      tournament = draft;
+      tournament = created;
       ui.roundIndex = 0;
       ui.editingGameId = null;
       ui.setupDraft = null;
@@ -1197,6 +1451,10 @@ function loadTournament() {
 }
 
 function saveGame(gameId, card) {
+  if (!canScore()) {
+    showGameError(card, `Only ${tournament.ownerName || "the owner"} can enter scores.`);
+    return;
+  }
   const round = tournament.rounds[ui.roundIndex];
   const game = round.games.find((item) => item.id === gameId);
 
@@ -1358,6 +1616,10 @@ function confirmNewTournament() {
 
 function requestRegenerate() {
   if (!tournament || ui.busy) {
+    return;
+  }
+  if (!canRedraw()) {
+    showToast(`Only ${tournament.ownerName || "the owner"} can regenerate this draw.`, "error");
     return;
   }
 
@@ -1577,9 +1839,38 @@ async function boot() {
   }
 
   const config = await loadCloudConfig();
-  cloud = config ? createCloudClient(config) : null;
+  let returnUrl = null;
 
-  if (sharedId) {
+  if (config) {
+    try {
+      returnUrl = await initAuth(config);
+      authAvailable = true;
+      user = currentUser();
+      onUserChange(handleUserChange);
+    } catch {
+      // Sign-in unavailable; guests can still use everything.
+      authAvailable = false;
+    }
+  }
+  cloud = config ? createCloudClient(config, undefined, authAvailable ? getAccessToken : undefined) : null;
+
+  // Came back from Google: restore the page the user signed in from.
+  if (returnUrl) {
+    const restoredId = readSharedIdFromUrl();
+    if (restoredId) {
+      renderLoading("Opening tournament");
+      await openSharedTournament(restoredId);
+      if (user) showToast(`Signed in as ${user.name}.`);
+      return;
+    }
+    // Keep whatever was typed into the setup form before signing in.
+    const savedDraft = takeSavedDraft();
+    if (savedDraft) {
+      ui.setupDraft = savedDraft;
+    }
+  }
+
+  if (sharedId && !returnUrl) {
     if (!cloud) {
       setSharedIdInUrl(null);
       showInitialView();
@@ -1591,17 +1882,19 @@ async function boot() {
   }
 
   if (tournament?.cloud) {
+    // Re-render so the header shows the signed-in user and permissions.
+    renderTournament();
     resumeCachedCloudTournament();
+    if (returnUrl && user) showToast(`Signed in as ${user.name}.`);
     return;
   }
 
-  if (!tournament) {
-    const footnote = document.querySelector("#setup-footnote");
-    if (footnote) {
-      footnote.textContent = setupFootnote();
-    }
-    refreshRecentTournaments();
+  if (tournament) {
+    renderTournament();
+  } else {
+    renderSetup();
   }
+  if (returnUrl && user) showToast(`Signed in as ${user.name}.`);
 }
 
 function resumeCachedCloudTournament() {
@@ -1665,6 +1958,7 @@ async function openSharedTournament(id) {
   }
 
   backupLocalOnlyTournament();
+  rememberTournament(remote.id);
   tournament = remote;
   ui.roundIndex = firstOpenRoundIndex(tournament);
   ui.editingGameId = null;
@@ -1834,7 +2128,14 @@ async function flushPendingResults() {
       const rejected = error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status);
       if (rejected) {
         sync.pending.delete(key);
-        showToast(`The server rejected a score: ${error.message}`, "error");
+        const locked = error.status === 401 || error.status === 403;
+        showToast(
+          locked
+            ? "That score was not saved: scoring is now limited to the owner."
+            : `The server rejected a score: ${error.message}`,
+          "error"
+        );
+        setTimeout(() => pollOnce({ force: true }), 0);
         continue;
       }
       setSyncStatus("offline");
@@ -1919,14 +2220,26 @@ async function refreshRecentTournaments() {
     return;
   }
 
-  let rows;
+  const history = readHistory();
+  let owned = [];
+  let opened = [];
   try {
-    rows = await cloud.listTournaments(8);
+    [owned, opened] = await Promise.all([
+      user ? cloud.listOwnedTournaments(user.id, 8) : [],
+      history.length ? cloud.listTournamentsById(history) : []
+    ]);
   } catch {
     return;
   }
   // The setup page may have been replaced while the request was running.
-  if (!document.body.contains(container) || !rows?.length) {
+  if (!document.body.contains(container)) {
+    return;
+  }
+  const ownedIds = new Set(owned.map((row) => row.id));
+  opened = opened.filter((row) => !ownedIds.has(row.id)).slice(0, 8);
+  if (!owned.length && !opened.length) {
+    container.hidden = true;
+    container.innerHTML = "";
     return;
   }
 
@@ -1936,12 +2249,7 @@ async function refreshRecentTournaments() {
     hour: "2-digit",
     minute: "2-digit"
   });
-
-  container.innerHTML = `
-    <div class="recent-head">
-      <span class="eyebrow">Previous tournaments</span>
-      <small>Open to view or keep scoring</small>
-    </div>
+  const listMarkup = (rows) => `
     <ul class="recent-list">
       ${rows
         .map(
@@ -1957,6 +2265,27 @@ async function refreshRecentTournaments() {
         )
         .join("")}
     </ul>
+  `;
+
+  container.innerHTML = `
+    ${
+      owned.length
+        ? `<div class="recent-head">
+            <span class="eyebrow">Your tournaments</span>
+            <small>Created while signed in</small>
+          </div>
+          ${listMarkup(owned)}`
+        : ""
+    }
+    ${
+      opened.length
+        ? `<div class="recent-head ${owned.length ? "is-spaced" : ""}">
+            <span class="eyebrow">Recently opened</span>
+            <small>On this device</small>
+          </div>
+          ${listMarkup(opened)}`
+        : ""
+    }
   `;
   container.hidden = false;
 }
@@ -2107,6 +2436,21 @@ document.addEventListener("click", (event) => {
       input.value = button.dataset.games;
       updateSetupPreview();
     }
+    return;
+  }
+
+  if (action === "sign-in") {
+    startSignIn();
+    return;
+  }
+
+  if (action === "sign-out") {
+    handleSignOut();
+    return;
+  }
+
+  if (action === "set-edit-mode") {
+    changeEditMode(button.dataset.mode === "owner" ? "owner" : "anyone");
     return;
   }
 

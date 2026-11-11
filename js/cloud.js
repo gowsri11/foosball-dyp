@@ -32,7 +32,7 @@ export function createShareId(length = 10) {
 }
 
 export function toTournamentRow(tournament) {
-  return {
+  const row = {
     id: tournament.id,
     name: tournament.name,
     target_score: tournament.targetScore,
@@ -40,6 +40,12 @@ export function toTournamentRow(tournament) {
     players: tournament.players,
     rounds: stripScores(tournament.rounds)
   };
+  // The database decides the owner from the session. edit_mode is only a
+  // request and is forced to "anyone" for guest tournaments.
+  if (tournament.editMode) {
+    row.edit_mode = tournament.editMode;
+  }
+  return row;
 }
 
 export function stripScores(rounds) {
@@ -57,6 +63,7 @@ export function stripScores(rounds) {
 const PLAYER_ID = /^p\d{1,3}$/;
 const GAME_ID = /^[A-Za-z0-9]{1,16}$/;
 const TOURNAMENT_ID = /^[A-Za-z0-9]{8,24}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function invalid(reason) {
   throw new Error(`This tournament's saved data is invalid (${reason}).`);
@@ -80,6 +87,15 @@ export function validateTournamentRow(row) {
   }
   const drawVersion = row.draw_version ?? 1;
   if (!Number.isInteger(drawVersion) || drawVersion < 1) invalid("draw version");
+
+  const ownerId = row.owner_id ?? null;
+  if (ownerId !== null && (typeof ownerId !== "string" || !UUID.test(ownerId))) invalid("owner");
+  const ownerName = row.owner_name ?? null;
+  if (ownerName !== null && (typeof ownerName !== "string" || ownerName.length > 80)) {
+    invalid("owner name");
+  }
+  const editMode = row.edit_mode ?? "anyone";
+  if (editMode !== "owner" && editMode !== "anyone") invalid("edit mode");
 
   if (!Array.isArray(row.players) || row.players.length < 4 || row.players.length > 40) {
     invalid("players");
@@ -144,6 +160,9 @@ export function validateTournamentRow(row) {
     target_score: row.target_score,
     games_per_player: row.games_per_player,
     draw_version: drawVersion,
+    owner_id: ownerId,
+    owner_name: ownerId ? ownerName || "Owner" : null,
+    edit_mode: ownerId ? editMode : "anyone",
     players,
     rounds,
     game_results: results,
@@ -166,6 +185,9 @@ export function fromTournamentRow(untrustedRow) {
     id: row.id,
     cloud: true,
     drawVersion,
+    ownerId: row.owner_id,
+    ownerName: row.owner_name,
+    editMode: row.edit_mode,
     name: row.name,
     targetScore: row.target_score,
     gamesPerPlayer: row.games_per_player,
@@ -193,28 +215,67 @@ export function fromTournamentRow(untrustedRow) {
 export function tournamentSignature(tournament) {
   return JSON.stringify([
     tournament.drawVersion || 1,
+    tournament.editMode || "anyone",
     tournament.rounds.map((round) =>
       round.games.map((game) => [game.id, game.teamA, game.teamB, game.scoreA, game.scoreB])
     )
   ]);
 }
 
-export function createCloudClient(config, fetchImpl = globalThis.fetch) {
+function summaries(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter(
+      (row) =>
+        row &&
+        typeof row.id === "string" &&
+        TOURNAMENT_ID.test(row.id) &&
+        typeof row.name === "string" &&
+        Number.isInteger(row.games_per_player) &&
+        !Number.isNaN(Date.parse(row.created_at))
+    )
+    .map((row) => ({
+      id: row.id,
+      name: row.name.slice(0, 48),
+      created_at: row.created_at,
+      games_per_player: row.games_per_player,
+      playerCount: Array.isArray(row.players) ? row.players.length : 0
+    }));
+}
+
+/**
+ * @param getAccessToken optional async function returning the signed-in
+ *   user's access token, or null for guests.
+ */
+export function createCloudClient(
+  config,
+  fetchImpl = globalThis.fetch,
+  getAccessToken = async () => null
+) {
   const base = `${config.url}/rest/v1`;
-  const headers = {
-    apikey: config.key,
-    "Content-Type": "application/json"
-  };
-  // Legacy anon keys are JWTs and also go in Authorization. New
-  // sb_publishable_ keys must only be sent as apikey.
-  if (config.key.startsWith("eyJ")) {
-    headers.Authorization = `Bearer ${config.key}`;
+
+  async function buildHeaders(prefer) {
+    const headers = {
+      apikey: config.key,
+      "Content-Type": "application/json"
+    };
+    const token = await getAccessToken();
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    } else if (config.key.startsWith("eyJ")) {
+      // Legacy anon keys are JWTs and also go in Authorization. New
+      // sb_publishable_ keys must only be sent as apikey.
+      headers.Authorization = `Bearer ${config.key}`;
+    }
+    if (prefer) {
+      headers.Prefer = prefer;
+    }
+    return headers;
   }
 
   async function request(path, { method = "GET", body, prefer } = {}) {
     const response = await fetchImpl(`${base}${path}`, {
       method,
-      headers: prefer ? { ...headers, Prefer: prefer } : headers,
+      headers: await buildHeaders(prefer),
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store"
     });
@@ -240,12 +301,27 @@ export function createCloudClient(config, fetchImpl = globalThis.fetch) {
   }
 
   return {
+    /** Returns the stored tournament, including the owner the server set. */
     async createTournament(tournament) {
-      await request("/tournaments", {
+      const rows = await request("/tournaments", {
         method: "POST",
         body: toTournamentRow(tournament),
-        prefer: "return=minimal"
+        prefer: "return=representation"
       });
+      if (!Array.isArray(rows) || rows.length !== 1) {
+        throw new Error("The server did not confirm the new tournament.");
+      }
+      return fromTournamentRow({ ...rows[0], game_results: [] });
+    },
+
+    /** Returns false if the change was not allowed (not the owner). */
+    async setEditMode(tournamentId, editMode) {
+      const rows = await request(`/tournaments?id=eq.${encodeURIComponent(tournamentId)}`, {
+        method: "PATCH",
+        body: { edit_mode: editMode },
+        prefer: "return=representation"
+      });
+      return Array.isArray(rows) && rows.length === 1;
     },
 
     async fetchTournament(id) {
@@ -256,27 +332,31 @@ export function createCloudClient(config, fetchImpl = globalThis.fetch) {
       return rows && rows.length ? fromTournamentRow(rows[0]) : null;
     },
 
-    async listTournaments(limit = 12) {
-      const rows = await request(
-        `/tournaments?select=id,name,created_at,games_per_player,players&order=created_at.desc&limit=${limit}`
-      );
-      return (Array.isArray(rows) ? rows : [])
-        .filter(
-          (row) =>
-            row &&
-            typeof row.id === "string" &&
-            TOURNAMENT_ID.test(row.id) &&
-            typeof row.name === "string" &&
-            Number.isInteger(row.games_per_player) &&
-            !Number.isNaN(Date.parse(row.created_at))
+    /** Tournaments owned by the signed-in user. */
+    async listOwnedTournaments(ownerId, limit = 12) {
+      if (!UUID.test(String(ownerId))) {
+        return [];
+      }
+      return summaries(
+        await request(
+          `/tournaments?owner_id=eq.${ownerId}&select=id,name,created_at,games_per_player,players&order=created_at.desc&limit=${limit}`
         )
-        .map((row) => ({
-          id: row.id,
-          name: row.name.slice(0, 48),
-          created_at: row.created_at,
-          games_per_player: row.games_per_player,
-          playerCount: Array.isArray(row.players) ? row.players.length : 0
-        }));
+      );
+    },
+
+    /** Summaries for tournaments this browser has opened before. */
+    async listTournamentsById(ids) {
+      const safe = ids.filter((id) => TOURNAMENT_ID.test(String(id))).slice(0, 20);
+      if (!safe.length) {
+        return [];
+      }
+      const rows = summaries(
+        await request(
+          `/tournaments?id=in.(${safe.join(",")})&select=id,name,created_at,games_per_player,players`
+        )
+      );
+      const order = new Map(safe.map((id, index) => [id, index]));
+      return rows.sort((a, b) => order.get(a.id) - order.get(b.id));
     },
 
     async saveResult(tournamentId, drawVersion, gameId, scoreA, scoreB) {

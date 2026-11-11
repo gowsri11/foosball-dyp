@@ -23,8 +23,34 @@ const types = {
   ".png": "image/png"
 };
 
+// Only the app's own files are served. Everything else in the project
+// folder (.env.local, .git, scripts, migrations) stays private.
+const PUBLIC_FILES = new Set(["/index.html", "/styles.css"]);
+const PUBLIC_DIRS = ["/js/"];
+const ALLOWED_HOSTS = new Set([
+  `127.0.0.1:${port}`,
+  `localhost:${port}`,
+  `[::1]:${port}`,
+  `${host}:${port}`
+]);
+
+function isPublicPath(pathname) {
+  if (pathname.split("/").some((segment) => segment.startsWith("."))) {
+    return false;
+  }
+  return PUBLIC_FILES.has(pathname) || PUBLIC_DIRS.some((dir) => pathname.startsWith(dir));
+}
+
 const server = createServer(async (request, response) => {
   try {
+    // Reject other Host headers so a web page cannot reach this server
+    // through DNS rebinding.
+    if (!ALLOWED_HOSTS.has(String(request.headers.host || "").toLowerCase())) {
+      response.writeHead(403);
+      response.end("Forbidden");
+      return;
+    }
+
     const url = new URL(request.url, `http://${request.headers.host}`);
 
     if (url.pathname === "/api/config") {
@@ -40,7 +66,10 @@ const server = createServer(async (request, response) => {
         : decodeURIComponent(url.pathname);
     const filePath = resolve(root, `.${pathname}`);
 
-    if (!filePath.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) {
+    if (
+      !isPublicPath(pathname) ||
+      !filePath.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
+    ) {
       response.writeHead(403);
       response.end("Forbidden");
       return;
