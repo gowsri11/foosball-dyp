@@ -2532,6 +2532,15 @@ button svg {
   color: var(--muted);
 }
 
+.dialog-list {
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+}
+
+.recent-item.is-current {
+  border-color: rgba(215, 255, 95, 0.3);
+}
+
 .recent-head.is-spaced {
   margin-top: 18px;
 }

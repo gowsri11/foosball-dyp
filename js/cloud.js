@@ -63,7 +63,6 @@ export function stripScores(rounds) {
 const PLAYER_ID = /^p\d{1,3}$/;
 const GAME_ID = /^[A-Za-z0-9]{1,16}$/;
 const TOURNAMENT_ID = /^[A-Za-z0-9]{8,24}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function invalid(reason) {
   throw new Error(`This tournament's saved data is invalid (${reason}).`);
@@ -88,8 +87,10 @@ export function validateTournamentRow(row) {
   const drawVersion = row.draw_version ?? 1;
   if (!Number.isInteger(drawVersion) || drawVersion < 1) invalid("draw version");
 
-  const ownerId = row.owner_id ?? null;
-  if (ownerId !== null && (typeof ownerId !== "string" || !UUID.test(ownerId))) invalid("owner");
+  const owned = row.owned === true;
+  if (row.owned !== undefined && typeof row.owned !== "boolean") invalid("owner");
+  if (row.is_owner !== undefined && typeof row.is_owner !== "boolean") invalid("owner");
+  const isOwner = owned && row.is_owner === true;
   const ownerName = row.owner_name ?? null;
   if (ownerName !== null && (typeof ownerName !== "string" || ownerName.length > 80)) {
     invalid("owner name");
@@ -160,9 +161,10 @@ export function validateTournamentRow(row) {
     target_score: row.target_score,
     games_per_player: row.games_per_player,
     draw_version: drawVersion,
-    owner_id: ownerId,
-    owner_name: ownerId ? ownerName || "Owner" : null,
-    edit_mode: ownerId ? editMode : "anyone",
+    owned,
+    is_owner: isOwner,
+    owner_name: owned ? ownerName || "Owner" : null,
+    edit_mode: owned ? editMode : "anyone",
     players,
     rounds,
     game_results: results,
@@ -185,7 +187,8 @@ export function fromTournamentRow(untrustedRow) {
     id: row.id,
     cloud: true,
     drawVersion,
-    ownerId: row.owner_id,
+    owned: row.owned,
+    isOwner: row.is_owner,
     ownerName: row.owner_name,
     editMode: row.edit_mode,
     name: row.name,
@@ -216,6 +219,7 @@ export function tournamentSignature(tournament) {
   return JSON.stringify([
     tournament.drawVersion || 1,
     tournament.editMode || "anyone",
+    Boolean(tournament.isOwner),
     tournament.rounds.map((round) =>
       round.games.map((game) => [game.id, game.teamA, game.teamB, game.scoreA, game.scoreB])
     )
@@ -238,7 +242,7 @@ function summaries(rows) {
       name: row.name.slice(0, 48),
       created_at: row.created_at,
       games_per_player: row.games_per_player,
-      playerCount: Array.isArray(row.players) ? row.players.length : 0
+      playerCount: Number.isInteger(row.player_count) ? row.player_count : 0
     }));
 }
 
@@ -300,48 +304,43 @@ export function createCloudClient(
     return text ? JSON.parse(text) : null;
   }
 
+  const rpc = (name, args) => request(`/rpc/${name}`, { method: "POST", body: args });
+
   return {
     /** Returns the stored tournament, including the owner the server set. */
     async createTournament(tournament) {
-      const rows = await request("/tournaments", {
-        method: "POST",
-        body: toTournamentRow(tournament),
-        prefer: "return=representation"
+      const row = toTournamentRow(tournament);
+      const stored = await rpc("create_tournament", {
+        p_id: row.id,
+        p_name: row.name,
+        p_target_score: row.target_score,
+        p_games_per_player: row.games_per_player,
+        p_players: row.players,
+        p_rounds: row.rounds,
+        p_edit_mode: row.edit_mode ?? null
       });
-      if (!Array.isArray(rows) || rows.length !== 1) {
+      if (!stored || typeof stored !== "object") {
         throw new Error("The server did not confirm the new tournament.");
       }
-      return fromTournamentRow({ ...rows[0], game_results: [] });
+      return fromTournamentRow(stored);
+    },
+
+    async fetchTournament(id) {
+      if (!TOURNAMENT_ID.test(String(id))) {
+        return null;
+      }
+      const row = await rpc("get_tournament", { p_id: id });
+      return row ? fromTournamentRow(row) : null;
     },
 
     /** Returns false if the change was not allowed (not the owner). */
     async setEditMode(tournamentId, editMode) {
-      const rows = await request(`/tournaments?id=eq.${encodeURIComponent(tournamentId)}`, {
-        method: "PATCH",
-        body: { edit_mode: editMode },
-        prefer: "return=representation"
-      });
-      return Array.isArray(rows) && rows.length === 1;
-    },
-
-    async fetchTournament(id) {
-      const rows = await request(
-        `/tournaments?id=eq.${encodeURIComponent(id)}` +
-          "&select=*,game_results(draw_version,game_id,score_a,score_b)"
-      );
-      return rows && rows.length ? fromTournamentRow(rows[0]) : null;
+      return (await rpc("set_edit_mode", { p_id: tournamentId, p_mode: editMode })) === true;
     },
 
     /** Tournaments owned by the signed-in user. */
-    async listOwnedTournaments(ownerId, limit = 12) {
-      if (!UUID.test(String(ownerId))) {
-        return [];
-      }
-      return summaries(
-        await request(
-          `/tournaments?owner_id=eq.${ownerId}&select=id,name,created_at,games_per_player,players&order=created_at.desc&limit=${limit}`
-        )
-      );
+    async listOwnedTournaments(limit = 12) {
+      return summaries(await rpc("my_tournaments", { p_limit: limit }));
     },
 
     /** Summaries for tournaments this browser has opened before. */
@@ -350,26 +349,18 @@ export function createCloudClient(
       if (!safe.length) {
         return [];
       }
-      const rows = summaries(
-        await request(
-          `/tournaments?id=in.(${safe.join(",")})&select=id,name,created_at,games_per_player,players`
-        )
-      );
+      const rows = summaries(await rpc("list_tournaments", { p_ids: safe }));
       const order = new Map(safe.map((id, index) => [id, index]));
       return rows.sort((a, b) => order.get(a.id) - order.get(b.id));
     },
 
     async saveResult(tournamentId, drawVersion, gameId, scoreA, scoreB) {
-      await request("/game_results", {
-        method: "POST",
-        body: {
-          tournament_id: tournamentId,
-          draw_version: drawVersion,
-          game_id: gameId,
-          score_a: scoreA,
-          score_b: scoreB
-        },
-        prefer: "resolution=merge-duplicates,return=minimal"
+      await rpc("save_result", {
+        p_tournament_id: tournamentId,
+        p_draw_version: drawVersion,
+        p_game_id: gameId,
+        p_score_a: scoreA,
+        p_score_b: scoreB
       });
     },
 
@@ -378,15 +369,13 @@ export function createCloudClient(
      * Returns false when the stored draw had already moved on.
      */
     async replaceDraw(tournamentId, expectedVersion, rounds) {
-      const rows = await request(
-        `/tournaments?id=eq.${encodeURIComponent(tournamentId)}&draw_version=eq.${expectedVersion}`,
-        {
-          method: "PATCH",
-          body: { rounds: stripScores(rounds), draw_version: expectedVersion + 1 },
-          prefer: "return=representation"
-        }
+      return (
+        (await rpc("redraw_tournament", {
+          p_id: tournamentId,
+          p_expected_version: expectedVersion,
+          p_rounds: stripScores(rounds)
+        })) === true
       );
-      return Array.isArray(rows) && rows.length === 1;
     }
   };
 }

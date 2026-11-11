@@ -381,10 +381,17 @@ function authControlMarkup() {
       </button>
     `;
   }
+  const mine = `
+    <button class="button ghost compact header-secondary" type="button" data-action="my-tournaments" aria-label="My tournaments">
+      ${icon("grid")}
+      <span>My tournaments</span>
+    </button>
+  `;
   const avatar = user.avatarUrl
     ? `<img class="auth-avatar" src="${escapeHtml(user.avatarUrl)}" alt="" referrerpolicy="no-referrer" />`
     : `<span class="avatar small" style="--avatar-hue: ${hueForName(user.name)}" aria-hidden="true">${escapeHtml(initialsForName(user.name))}</span>`;
   return `
+    ${mine}
     <span class="auth-user" title="${escapeHtml(user.email)}">
       ${avatar}
       <span class="auth-name">${escapeHtml(user.name)}</span>
@@ -394,18 +401,18 @@ function authControlMarkup() {
 }
 
 function isOwner(current = tournament) {
-  return Boolean(current?.ownerId && user && current.ownerId === user.id);
+  return Boolean(current?.owned && current.isOwner && user);
 }
 
 function canScore(current = tournament) {
-  if (!current?.cloud || !current.ownerId) {
+  if (!current?.cloud || !current.owned) {
     return true;
   }
   return current.editMode === "anyone" || isOwner(current);
 }
 
 function canRedraw(current = tournament) {
-  if (!current?.cloud || !current.ownerId) {
+  if (!current?.cloud || !current.owned) {
     return true;
   }
   return isOwner(current);
@@ -415,7 +422,7 @@ function accessBarMarkup() {
   if (!tournament?.cloud) {
     return "";
   }
-  if (!tournament.ownerId) {
+  if (!tournament.owned) {
     return `
       <div class="access-bar">
         <span class="access-text">
@@ -500,6 +507,11 @@ async function handleSignOut() {
 function handleUserChange(nextUser) {
   user = nextUser;
   if (tournament) {
+    if (tournament.cloud) {
+      // Ownership is decided by the server for the signed-in user.
+      tournament.isOwner = false;
+      pollOnce({ force: true });
+    }
     ui.editingGameId = canScore() ? ui.editingGameId : null;
     renderTournament();
   } else {
@@ -1287,7 +1299,8 @@ function handleSetupSubmit(event) {
           created = {
             ...draft,
             cloud: true,
-            ownerId: stored.ownerId,
+            owned: stored.owned,
+            isOwner: stored.isOwner,
             ownerName: stored.ownerName,
             editMode: stored.editMode,
             createdAt: stored.createdAt || draft.createdAt,
@@ -2214,35 +2227,18 @@ function setSharedIdInUrl(id) {
   window.history.replaceState(null, "", url);
 }
 
-async function refreshRecentTournaments() {
-  const container = document.querySelector("#recent-tournaments");
-  if (!container || !cloud) {
-    return;
-  }
-
+async function loadRecentLists() {
   const history = readHistory();
-  let owned = [];
-  let opened = [];
-  try {
-    [owned, opened] = await Promise.all([
-      user ? cloud.listOwnedTournaments(user.id, 8) : [],
-      history.length ? cloud.listTournamentsById(history) : []
-    ]);
-  } catch {
-    return;
-  }
-  // The setup page may have been replaced while the request was running.
-  if (!document.body.contains(container)) {
-    return;
-  }
+  const [owned, openedAll] = await Promise.all([
+    user ? cloud.listOwnedTournaments(20) : [],
+    history.length ? cloud.listTournamentsById(history) : []
+  ]);
   const ownedIds = new Set(owned.map((row) => row.id));
-  opened = opened.filter((row) => !ownedIds.has(row.id)).slice(0, 8);
-  if (!owned.length && !opened.length) {
-    container.hidden = true;
-    container.innerHTML = "";
-    return;
-  }
+  const opened = openedAll.filter((row) => !ownedIds.has(row.id)).slice(0, 10);
+  return { owned, opened };
+}
 
+function recentListsMarkup({ owned, opened }, { currentId = null } = {}) {
   const dateFormat = new Intl.DateTimeFormat(undefined, {
     day: "numeric",
     month: "short",
@@ -2255,9 +2251,9 @@ async function refreshRecentTournaments() {
         .map(
           (row) => `
             <li>
-              <a class="recent-item" href="${escapeHtml(shareUrl(row.id))}">
+              <a class="recent-item ${row.id === currentId ? "is-current" : ""}" href="${escapeHtml(shareUrl(row.id))}">
                 <strong>${escapeHtml(row.name)}</strong>
-                <span>${row.playerCount} players · ${row.games_per_player} games · ${escapeHtml(dateFormat.format(new Date(row.created_at)))}</span>
+                <span>${row.playerCount} players · ${row.games_per_player} games · ${escapeHtml(dateFormat.format(new Date(row.created_at)))}${row.id === currentId ? " · open now" : ""}</span>
                 ${icon("chevronRight")}
               </a>
             </li>
@@ -2266,8 +2262,7 @@ async function refreshRecentTournaments() {
         .join("")}
     </ul>
   `;
-
-  container.innerHTML = `
+  return `
     ${
       owned.length
         ? `<div class="recent-head">
@@ -2287,7 +2282,61 @@ async function refreshRecentTournaments() {
         : ""
     }
   `;
+}
+
+async function refreshRecentTournaments() {
+  const container = document.querySelector("#recent-tournaments");
+  if (!container || !cloud) {
+    return;
+  }
+  let lists;
+  try {
+    lists = await loadRecentLists();
+  } catch {
+    return;
+  }
+  // The setup page may have been replaced while the request was running.
+  if (!document.body.contains(container)) {
+    return;
+  }
+  if (!lists.owned.length && !lists.opened.length) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+  container.innerHTML = recentListsMarkup(lists);
   container.hidden = false;
+}
+
+async function openTournamentsDialog() {
+  if (!cloud) {
+    return;
+  }
+  openDialog({
+    eyebrow: user ? `Signed in as ${user.name}` : "This device",
+    title: user ? "My tournaments" : "Recent tournaments",
+    body: `<div id="tournaments-dialog-list" class="dialog-list"><p class="dialog-muted">Loading...</p></div>`,
+    actions: [{ label: "Close", action: "close-dialog", variant: "ghost" }]
+  });
+  const target = () => document.querySelector("#tournaments-dialog-list");
+  try {
+    const lists = await loadRecentLists();
+    if (!target()) {
+      return;
+    }
+    target().innerHTML =
+      lists.owned.length || lists.opened.length
+        ? recentListsMarkup(lists, { currentId: tournament?.id })
+        : `<p class="dialog-muted">${
+            user
+              ? "You have not created any tournaments while signed in yet."
+              : "No tournaments opened on this device yet."
+          }</p>`;
+  } catch {
+    if (target()) {
+      target().innerHTML = `<p class="dialog-muted">Could not load tournaments. Check your connection and try again.</p>`;
+    }
+  }
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -2436,6 +2485,11 @@ document.addEventListener("click", (event) => {
       input.value = button.dataset.games;
       updateSetupPreview();
     }
+    return;
+  }
+
+  if (action === "my-tournaments") {
+    openTournamentsDialog();
     return;
   }
 
