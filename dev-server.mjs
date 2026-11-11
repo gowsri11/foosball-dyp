@@ -4,6 +4,14 @@ import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
+
+try {
+  process.loadEnvFile(`${root}.env.local`);
+} catch {
+  // no local env file; /api/config will report cloud sync as off
+}
+
+const { GET: getConfig } = await import("./api/config.js");
 const port = Number(process.env.PORT) || 4173;
 const host = process.env.HOST || "127.0.0.1";
 const types = {
@@ -18,6 +26,14 @@ const types = {
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
+
+    if (url.pathname === "/api/config") {
+      const result = getConfig();
+      response.writeHead(result.status, Object.fromEntries(result.headers));
+      response.end(await result.text());
+      return;
+    }
+
     const pathname =
       url.pathname === "/"
         ? "/index.html"

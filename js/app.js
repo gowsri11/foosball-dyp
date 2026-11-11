@@ -1,14 +1,25 @@
 import {
   computeStandings,
+  exactGameCounts,
   generateSchedule,
   getProgress,
   getSchedulePlan,
   isRecordedScore,
   isRoundComplete,
+  standingsMode,
   validateScore
 } from "./scheduler.js";
+import {
+  createCloudClient,
+  createShareId,
+  loadCloudConfig,
+  tournamentSignature
+} from "./cloud.js";
 
 const STORAGE_KEY = "foosball-dyp.v1";
+const LOCAL_BACKUP_KEY = "foosball-dyp.v1.local-backup";
+const POLL_INTERVAL_MS = 4000;
+const SHARE_ID_PATTERN = /^[A-Za-z0-9]{8,24}$/;
 const MAX_PLAYERS = 40;
 const MAX_GAMES_PER_PLAYER = 20;
 
@@ -22,6 +33,17 @@ let ui = {
   editingGameId: null,
   setupDraft: null,
   busy: false
+};
+
+// Live sync with Supabase. `cloud` stays null when /api/config has no keys,
+// and the app then works exactly as before, saving to this browser only.
+let cloud = null;
+const sync = {
+  status: "local",
+  timer: null,
+  inFlight: false,
+  deferred: false,
+  pending: new Map()
 };
 
 const icons = {
@@ -75,6 +97,12 @@ const icons = {
     <svg viewBox="0 0 20 20" aria-hidden="true">
       <path d="M10 3v9M6.5 8.5 10 12l3.5-3.5M4 15.5h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>`,
+  link: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      <path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>
+  `,
   info: `
     <svg viewBox="0 0 20 20" aria-hidden="true">
       <circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" stroke-width="1.4"/>
@@ -118,13 +146,7 @@ function icon(name) {
   return icons[name] || "";
 }
 
-if (tournament) {
-  const firstOpen = tournament.rounds.findIndex((round) => !isRoundComplete(round));
-  ui.roundIndex = firstOpen === -1 ? 0 : firstOpen;
-  renderTournament();
-} else {
-  renderSetup();
-}
+boot();
 
 function renderSetup() {
   const draft = ui.setupDraft || {
@@ -176,6 +198,8 @@ function renderSetup() {
           </div>
 
           ${sampleTicketMarkup()}
+
+          <div id="recent-tournaments" class="recent-tournaments" hidden></div>
         </section>
 
         <section class="setup-card card" aria-labelledby="create-title">
@@ -256,6 +280,8 @@ function renderSetup() {
               </div>
             </div>
 
+            <div id="games-hint" class="games-hint" aria-live="polite"></div>
+
             <div id="format-preview" class="format-preview" aria-live="polite"></div>
 
             <p id="setup-error" class="form-error" role="alert" hidden></p>
@@ -264,7 +290,7 @@ function renderSetup() {
               <span>Generate schedule</span>
               ${icon("arrow")}
             </button>
-            <p class="form-footnote">Your tournament stays in this browser. No account needed.</p>
+            <p id="setup-footnote" class="form-footnote">${setupFootnote()}</p>
           </form>
         </section>
       </main>
@@ -272,6 +298,29 @@ function renderSetup() {
   `;
 
   updateSetupPreview();
+  refreshRecentTournaments();
+}
+
+function setupFootnote() {
+  return cloud
+    ? "Saved online. Share the link so anyone can follow along and enter scores."
+    : "Your tournament stays in this browser. No account needed.";
+}
+
+function renderLoading(message) {
+  document.title = "Foosball DYP";
+  app.innerHTML = `
+    <div class="app-shell setup-shell">
+      <header class="site-header">${brandMarkup()}</header>
+      <main class="loading-main">
+        <div class="busy-card loading-card" role="status">
+          <span class="busy-spinner" aria-hidden="true">${icon("ball")}</span>
+          <strong>${escapeHtml(message)}</strong>
+          <span>Fetching the latest scores...</span>
+        </div>
+      </main>
+    </div>
+  `;
 }
 
 function renderTournament() {
@@ -292,6 +341,15 @@ function renderTournament() {
       <header class="site-header">
         ${brandMarkup()}
         <div class="header-actions">
+          ${syncPillMarkup()}
+          ${
+            tournament.cloud
+              ? `<button class="button ghost header-secondary" type="button" data-action="copy-link" aria-label="Copy tournament link">
+                  ${icon("link")}
+                  <span>Copy link</span>
+                </button>`
+              : ""
+          }
           <button class="button ghost header-secondary" type="button" data-action="show-rules" aria-label="How it works">
             ${icon("info")}
             <span>How it works</span>
@@ -568,8 +626,8 @@ function gameCardMarkup(game, index, round) {
   return `
     <article
       class="game-card ${complete && !editing ? "is-complete" : ""} ${editing ? "is-editing" : ""}"
-      data-game-id="${game.id}"
-      data-round-number="${round.number}"
+      data-game-id="${escapeHtml(game.id)}"
+      data-round-number="${escapeHtml(String(round.number))}"
     >
       <header class="game-card-head">
         <span class="match-label">Match ${index + 1}</span>
@@ -691,6 +749,7 @@ function byeMarkup(round) {
 }
 
 function standingsMarkup(standings, progress) {
+  const byWinRate = standings[0]?.mode === "winRate";
   return `
     <aside class="standings-card card" aria-labelledby="standings-title">
       <div class="standings-head">
@@ -712,7 +771,11 @@ function standingsMarkup(standings, progress) {
               <th title="Goals for">GF</th>
               <th title="Goals against">GA</th>
               <th title="Goal difference">GD</th>
-              <th class="col-points" title="Points">Pts</th>
+              ${
+                byWinRate
+                  ? `<th title="Points">Pts</th><th class="col-points" title="Win rate">Win %</th>`
+                  : `<th class="col-points" title="Points">Pts</th>`
+              }
             </tr>
           </thead>
           <tbody>
@@ -732,7 +795,11 @@ function standingsMarkup(standings, progress) {
                     <td>${player.goalsFor}</td>
                     <td>${player.goalsAgainst}</td>
                     <td class="${differenceClass(player.goalDifference)}">${formatDifference(player.goalDifference)}</td>
-                    <td class="col-points">${player.points}</td>
+                    ${
+                      byWinRate
+                        ? `<td>${player.points}</td><td class="col-points">${formatRate(player.winRate, player.played)}</td>`
+                        : `<td class="col-points">${player.points}</td>`
+                    }
                   </tr>
                 `
               )
@@ -743,7 +810,11 @@ function standingsMarkup(standings, progress) {
 
       <div class="tiebreak-note">
         ${icon("info")}
-        <span>Ties broken by points, then goal difference, then goals scored.</span>
+        <span>${
+          byWinRate
+            ? "Some players have an extra game, so ranking is by win rate, then goal difference per game, then goals per game."
+            : "Ties broken by points, then goal difference, then goals scored."
+        }</span>
       </div>
     </aside>
   `;
@@ -768,6 +839,7 @@ function updateSetupPreview() {
   const plan = getSchedulePlan(names.length, games);
 
   count.textContent = `${names.length} ${names.length === 1 ? "player" : "players"}`;
+  renderGamesHint(names.length, games, plan);
 
   if (duplicates.length) {
     preview.innerHTML = `
@@ -806,6 +878,58 @@ function updateSetupPreview() {
       <div><strong>${plan.byesTotal}</strong><span>${plan.byesTotal === 1 ? "bye" : "byes"}</span></div>
     </div>
     <p class="preview-note">${note}</p>
+  `;
+}
+
+function renderGamesHint(playerCount, games, plan) {
+  const hint = document.querySelector("#games-hint");
+  if (!hint) {
+    return;
+  }
+
+  const options = exactGameCounts(playerCount, MAX_GAMES_PER_PLAYER);
+  if (!plan.valid || options.length === 0) {
+    hint.innerHTML = "";
+    return;
+  }
+
+  const chips = options
+    .map(
+      (value) => `
+        <button
+          class="games-chip ${value === games ? "is-active" : ""}"
+          type="button"
+          data-action="set-games"
+          data-games="${value}"
+          aria-pressed="${value === games}"
+        >${value}</button>
+      `
+    )
+    .join("");
+
+  const warning = plan.extraAppearances
+    ? `
+      <div class="games-warning" role="status">
+        <span class="preview-icon">${icon("info")}</span>
+        <p>
+          <strong>Uneven games.</strong>
+          ${playerCount} players × ${games} ${games === 1 ? "game" : "games"} does not fill whole matches, so
+          ${plan.extraAppearances} ${plan.extraAppearances === 1 ? "player gets" : "players get"} one extra game.
+          The table will rank by win rate, then goal difference per game.
+        </p>
+      </div>
+    `
+    : "";
+
+  hint.innerHTML = `
+    <div class="games-hint-head">
+      <span>Equal games for everyone</span>
+      <small>Tap to use</small>
+    </div>
+    <div class="games-chips" role="group" aria-label="Games per player with equal games for everyone">
+      ${chips}
+    </div>
+    ${warning}
   `;
 }
 
@@ -887,7 +1011,7 @@ function handleSetupSubmit(event) {
   }
 
   showFormError("");
-  withBusy("Drawing your schedule", () => {
+  withBusy("Drawing your schedule", async () => {
     try {
       const players = setup.names.map((name, index) => ({
         id: `p${index + 1}`,
@@ -897,10 +1021,11 @@ function handleSetupSubmit(event) {
         attempts: attemptCountFor(players.length)
       });
       const now = new Date().toISOString();
-
-      tournament = {
+      const draft = {
         version: 1,
-        id: createId(),
+        id: cloud ? createShareId() : createId(),
+        cloud: false,
+        drawVersion: 1,
         name: setup.name,
         targetScore: setup.target === 10 ? 10 : 7,
         gamesPerPlayer: setup.games,
@@ -909,13 +1034,36 @@ function handleSetupSubmit(event) {
         createdAt: now,
         updatedAt: now
       };
+      let savedOnline = false;
+
+      if (cloud) {
+        try {
+          await cloud.createTournament(draft);
+          draft.cloud = true;
+          savedOnline = true;
+        } catch (cloudError) {
+          showToast(
+            "Could not reach the server. This tournament is saved on this device only.",
+            "error"
+          );
+        }
+      }
+
+      tournament = draft;
       ui.roundIndex = 0;
       ui.editingGameId = null;
       ui.setupDraft = null;
       persistTournament();
+      if (savedOnline) {
+        setSharedIdInUrl(tournament.id);
+        setSyncStatus("live");
+        startPolling();
+      } else {
+        setSyncStatus("local");
+      }
       renderTournament();
       showToast(
-        `Schedule ready: ${schedule.plan.rounds} rounds, ${schedule.plan.totalGames} matches.`
+        `Schedule ready: ${schedule.plan.rounds} rounds, ${schedule.plan.totalGames} matches. ${describeBalance(schedule.quality)}`
       );
     } catch (generationError) {
       showFormError(generationError.message);
@@ -928,11 +1076,36 @@ function regenerateTournament() {
     return;
   }
 
-  withBusy("Redrawing partners", () => {
+  withBusy("Redrawing partners", async () => {
     try {
       const schedule = generateSchedule(tournament.players, tournament.gamesPerPlayer, {
         attempts: attemptCountFor(tournament.players.length)
       });
+
+      if (tournament.cloud) {
+        if (!cloud) {
+          showToast("Live sync is offline, so the shared draw cannot be changed.", "error");
+          return;
+        }
+        let replaced;
+        try {
+          replaced = await cloud.replaceDraw(
+            tournament.id,
+            tournament.drawVersion || 1,
+            schedule.rounds
+          );
+        } catch (cloudError) {
+          showToast("Could not reach the server. The draw was not changed.", "error");
+          return;
+        }
+        if (!replaced) {
+          showToast("Someone else redrew this tournament first. Loading their draw.", "error");
+          await pollOnce({ force: true });
+          return;
+        }
+        tournament.drawVersion = (tournament.drawVersion || 1) + 1;
+        sync.pending.clear();
+      }
 
       tournament.rounds = schedule.rounds;
       tournament.updatedAt = new Date().toISOString();
@@ -940,11 +1113,20 @@ function regenerateTournament() {
       ui.editingGameId = null;
       persistTournament();
       renderTournament();
-      showToast("New draw ready. All scores reset.");
+      showToast(`New draw ready. All scores reset. ${describeBalance(schedule.quality)}`);
     } catch (generationError) {
       showToast(generationError.message, "error");
     }
   });
+}
+
+function describeBalance(quality) {
+  const times = (summary) =>
+    summary.min === summary.max
+      ? `${summary.min}×`
+      : `${summary.min}–${summary.max}×`;
+
+  return `Each pair teams up ${times(quality.partner)} and faces off ${times(quality.opponent)}.`;
 }
 
 function attemptCountFor(playerCount) {
@@ -1046,7 +1228,11 @@ function saveGame(gameId, card) {
   game.scoreB = scoreB;
   tournament.updatedAt = new Date().toISOString();
   ui.editingGameId = null;
+  sync.deferred = false;
   persistTournament();
+  if (tournament.cloud) {
+    queueResult(game);
+  }
   renderTournament();
 
   const nowComplete = isRoundComplete(round);
@@ -1122,8 +1308,12 @@ function openNewTournamentDialog() {
       <p>
         ${
           progress.completed
-            ? `This draw has ${progress.completed} saved ${progress.completed === 1 ? "result" : "results"}. Starting fresh will erase the schedule and every score.`
-            : "The current draw will be replaced with a new setup."
+            ? tournament.cloud
+              ? "This tournament stays saved online. You can reopen it any time from its link or the recent list."
+              : `This draw has ${progress.completed} saved ${progress.completed === 1 ? "result" : "results"}. Starting fresh will erase the schedule and every score.`
+            : tournament.cloud
+              ? "This tournament stays saved online and can be reopened from its link."
+              : "The current draw will be replaced with a new setup."
         }
       </p>
       <p class="dialog-muted">Your current player list will be kept in the setup form for a quick rematch.</p>
@@ -1142,6 +1332,10 @@ function openNewTournamentDialog() {
 function confirmNewTournament() {
   const previous = tournament;
 
+  stopPolling();
+  sync.pending.clear();
+  sync.deferred = false;
+  setSharedIdInUrl(null);
   tournament = null;
   ui = {
     roundIndex: 0,
@@ -1216,7 +1410,7 @@ function showRulesDialog() {
         </div>
         <div class="rule-item">
           <span class="rule-number">05</span>
-          <div><strong>Clear tiebreakers.</strong><p>Standings sort by points, then goal difference, then goals scored. No endless group-stage arguments.</p></div>
+          <div><strong>Clear tiebreakers.</strong><p>Standings sort by points, then goal difference, then goals scored. If some players have an extra game, the table ranks by win rate, then goal difference per game, so the extra match is no advantage.</p></div>
         </div>
       </div>
     `,
@@ -1240,7 +1434,8 @@ function exportStandings() {
       "Goals For",
       "Goals Against",
       "Goal Difference",
-      "Points"
+      "Points",
+      "Win Rate"
     ],
     ...standings.map((player) => [
       player.rank,
@@ -1251,7 +1446,8 @@ function exportStandings() {
       player.goalsFor,
       player.goalsAgainst,
       player.goalDifference,
-      player.points
+      player.points,
+      formatRate(player.winRate, player.played)
     ])
   ];
   const csv = rows
@@ -1341,9 +1537,9 @@ function withBusy(message, task) {
   const overlay = showBusy(message);
 
   requestAnimationFrame(() => {
-    setTimeout(() => {
+    setTimeout(async () => {
       try {
-        task();
+        await task();
       } finally {
         overlay.remove();
         ui.busy = false;
@@ -1371,6 +1567,417 @@ function showToast(message, type = "success") {
   }, 3400);
 }
 
+async function boot() {
+  const sharedId = readSharedIdFromUrl();
+
+  if (sharedId) {
+    renderLoading("Opening tournament");
+  } else {
+    showInitialView();
+  }
+
+  const config = await loadCloudConfig();
+  cloud = config ? createCloudClient(config) : null;
+
+  if (sharedId) {
+    if (!cloud) {
+      setSharedIdInUrl(null);
+      showInitialView();
+      showToast("Live sync is not set up here, so shared links cannot be opened.", "error");
+      return;
+    }
+    await openSharedTournament(sharedId);
+    return;
+  }
+
+  if (tournament?.cloud) {
+    resumeCachedCloudTournament();
+    return;
+  }
+
+  if (!tournament) {
+    const footnote = document.querySelector("#setup-footnote");
+    if (footnote) {
+      footnote.textContent = setupFootnote();
+    }
+    refreshRecentTournaments();
+  }
+}
+
+function resumeCachedCloudTournament() {
+  if (!tournament?.cloud) {
+    return;
+  }
+  setSharedIdInUrl(tournament.id);
+  if (!cloud) {
+    setSyncStatus("offline");
+    return;
+  }
+  setSyncStatus("connecting");
+  startPolling();
+  pollOnce({ force: true });
+}
+
+function showInitialView() {
+  if (tournament) {
+    ui.roundIndex = firstOpenRoundIndex(tournament);
+    setSyncStatus(tournament.cloud ? "connecting" : "local");
+    renderTournament();
+  } else {
+    renderSetup();
+  }
+}
+
+function firstOpenRoundIndex(current) {
+  const firstOpen = current.rounds.findIndex((round) => !isRoundComplete(round));
+  return firstOpen === -1 ? 0 : firstOpen;
+}
+
+async function openSharedTournament(id) {
+  const cached = tournament && tournament.id === id ? tournament : null;
+  let remote = null;
+
+  try {
+    remote = await cloud.fetchTournament(id);
+  } catch (error) {
+    if (cached) {
+      tournament = cached;
+      ui.roundIndex = firstOpenRoundIndex(tournament);
+      setSyncStatus("offline");
+      renderTournament();
+      startPolling();
+      showToast("Could not reach the server. Showing the last saved copy.", "error");
+      return;
+    }
+    setSharedIdInUrl(null);
+    showInitialView();
+    resumeCachedCloudTournament();
+    showToast("Could not reach the server to open that tournament.", "error");
+    return;
+  }
+
+  if (!remote) {
+    setSharedIdInUrl(null);
+    showInitialView();
+    resumeCachedCloudTournament();
+    showToast("That tournament link does not exist.", "error");
+    return;
+  }
+
+  backupLocalOnlyTournament();
+  tournament = remote;
+  ui.roundIndex = firstOpenRoundIndex(tournament);
+  ui.editingGameId = null;
+  ui.setupDraft = null;
+  persistTournament();
+  setSyncStatus("live");
+  renderTournament();
+  startPolling();
+}
+
+// Opening someone's link replaces the cached tournament. Keep a local-only
+// one so it is not silently lost.
+function backupLocalOnlyTournament() {
+  if (!tournament || tournament.cloud) {
+    return;
+  }
+  try {
+    localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(tournament));
+  } catch {
+    // storage full or blocked; nothing else to do
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  sync.timer = setInterval(() => {
+    pollOnce();
+  }, POLL_INTERVAL_MS);
+}
+
+function stopPolling() {
+  if (sync.timer) {
+    clearInterval(sync.timer);
+    sync.timer = null;
+  }
+}
+
+async function pollOnce({ force = false } = {}) {
+  if (!cloud || !tournament?.cloud || sync.inFlight) {
+    return;
+  }
+  if (!force && document.hidden) {
+    return;
+  }
+
+  sync.inFlight = true;
+  const id = tournament.id;
+
+  try {
+    await flushPendingResults();
+    const remote = await cloud.fetchTournament(id);
+    if (!tournament || tournament.id !== id) {
+      return;
+    }
+    if (!remote) {
+      setSyncStatus("offline");
+      return;
+    }
+    setSyncStatus(sync.pending.size ? "offline" : "live");
+    applyRemoteTournament(remote);
+  } catch (error) {
+    setSyncStatus("offline");
+  } finally {
+    sync.inFlight = false;
+  }
+}
+
+function applyRemoteTournament(remote) {
+  // Scores saved here but not yet confirmed by the server win over the
+  // server copy, so a slow upload does not flicker back to empty.
+  for (const pending of sync.pending.values()) {
+    if (pending.tournamentId !== remote.id || pending.drawVersion !== remote.drawVersion) {
+      continue;
+    }
+    for (const round of remote.rounds) {
+      const game = round.games.find((item) => item.id === pending.gameId);
+      if (game) {
+        game.scoreA = pending.scoreA;
+        game.scoreB = pending.scoreB;
+      }
+    }
+  }
+
+  const drawChanged = (remote.drawVersion || 1) !== (tournament.drawVersion || 1);
+  const changed = tournamentSignature(remote) !== tournamentSignature(tournament);
+
+  if (!changed && !sync.deferred) {
+    return;
+  }
+
+  tournament = remote;
+  persistTournament();
+
+  if (drawChanged) {
+    // Game ids repeat between draws, so an open score form would point at a
+    // different match. Re-render right away.
+    sync.pending.clear();
+    ui.editingGameId = null;
+    sync.deferred = false;
+    ui.roundIndex = firstOpenRoundIndex(tournament);
+    renderTournament();
+    showToast("The draw was regenerated on another device. Scores were reset.");
+    return;
+  }
+
+  if (isUserTyping()) {
+    sync.deferred = true;
+    return;
+  }
+
+  sync.deferred = false;
+  const scrollY = window.scrollY;
+  renderTournament();
+  window.scrollTo(0, scrollY);
+}
+
+function isUserTyping() {
+  if (ui.busy || ui.editingGameId) {
+    return true;
+  }
+  return [...document.querySelectorAll(".score-input")].some(
+    (input) => input === document.activeElement || input.value !== input.defaultValue
+  );
+}
+
+function queueResult(game) {
+  const key = `${tournament.id}:${game.id}`;
+  sync.pending.set(key, {
+    tournamentId: tournament.id,
+    drawVersion: tournament.drawVersion || 1,
+    gameId: game.id,
+    scoreA: game.scoreA,
+    scoreB: game.scoreB
+  });
+  updateSyncPill();
+  flushPendingResults();
+}
+
+async function flushPendingResults() {
+  if (!cloud) {
+    return;
+  }
+
+  for (const [key, pending] of [...sync.pending]) {
+    const stale =
+      !tournament ||
+      pending.tournamentId !== tournament.id ||
+      pending.drawVersion !== (tournament.drawVersion || 1);
+    if (stale) {
+      sync.pending.delete(key);
+      continue;
+    }
+
+    try {
+      await cloud.saveResult(
+        pending.tournamentId,
+        pending.drawVersion,
+        pending.gameId,
+        pending.scoreA,
+        pending.scoreB
+      );
+      if (sync.pending.get(key) === pending) {
+        sync.pending.delete(key);
+      }
+      setSyncStatus(sync.pending.size ? "offline" : "live");
+    } catch (error) {
+      const rejected = error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status);
+      if (rejected) {
+        sync.pending.delete(key);
+        showToast(`The server rejected a score: ${error.message}`, "error");
+        continue;
+      }
+      setSyncStatus("offline");
+      break;
+    }
+  }
+  updateSyncPill();
+}
+
+function setSyncStatus(status) {
+  sync.status = status;
+  updateSyncPill();
+}
+
+function syncPillMarkup() {
+  return `<span id="sync-pill" class="sync-pill is-${tournament?.cloud ? sync.status : "local"}" role="status">${syncPillLabel()}</span>`;
+}
+
+function syncPillLabel() {
+  if (!tournament?.cloud) {
+    return "This device only";
+  }
+  const unsaved = sync.pending.size;
+  if (sync.status === "live" && !unsaved) {
+    return "Live";
+  }
+  if (sync.status === "connecting") {
+    return "Connecting";
+  }
+  return unsaved ? `Offline · ${unsaved} unsaved` : "Offline · retrying";
+}
+
+function updateSyncPill() {
+  const pill = document.querySelector("#sync-pill");
+  if (!pill) {
+    return;
+  }
+  const status = tournament?.cloud ? sync.status : "local";
+  pill.className = `sync-pill is-${status === "live" && sync.pending.size ? "offline" : status}`;
+  pill.textContent = syncPillLabel();
+}
+
+function shareUrl(id) {
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("t", id);
+  return url.toString();
+}
+
+async function copyShareLink() {
+  if (!tournament?.cloud) {
+    return;
+  }
+  const link = shareUrl(tournament.id);
+  try {
+    await navigator.clipboard.writeText(link);
+    showToast("Link copied. Anyone with it can follow and enter scores.");
+  } catch {
+    window.prompt("Copy this tournament link", link);
+  }
+}
+
+function readSharedIdFromUrl() {
+  const id = new URLSearchParams(window.location.search).get("t");
+  return id && SHARE_ID_PATTERN.test(id) ? id : null;
+}
+
+function setSharedIdInUrl(id) {
+  const url = new URL(window.location.href);
+  if (id) {
+    url.searchParams.set("t", id);
+  } else {
+    url.searchParams.delete("t");
+  }
+  window.history.replaceState(null, "", url);
+}
+
+async function refreshRecentTournaments() {
+  const container = document.querySelector("#recent-tournaments");
+  if (!container || !cloud) {
+    return;
+  }
+
+  let rows;
+  try {
+    rows = await cloud.listTournaments(8);
+  } catch {
+    return;
+  }
+  // The setup page may have been replaced while the request was running.
+  if (!document.body.contains(container) || !rows?.length) {
+    return;
+  }
+
+  const dateFormat = new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+
+  container.innerHTML = `
+    <div class="recent-head">
+      <span class="eyebrow">Previous tournaments</span>
+      <small>Open to view or keep scoring</small>
+    </div>
+    <ul class="recent-list">
+      ${rows
+        .map(
+          (row) => `
+            <li>
+              <a class="recent-item" href="${escapeHtml(shareUrl(row.id))}">
+                <strong>${escapeHtml(row.name)}</strong>
+                <span>${row.playerCount} players · ${row.games_per_player} games · ${escapeHtml(dateFormat.format(new Date(row.created_at)))}</span>
+                ${icon("chevronRight")}
+              </a>
+            </li>
+          `
+        )
+        .join("")}
+    </ul>
+  `;
+  container.hidden = false;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    pollOnce();
+  }
+});
+
+document.addEventListener("focusout", () => {
+  // A remote update arrived while someone was typing. Apply it once they
+  // leave the score fields without unsaved input.
+  setTimeout(() => {
+    if (sync.deferred && tournament && !isUserTyping()) {
+      sync.deferred = false;
+      renderTournament();
+    }
+  }, 0);
+});
+
 function createId() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -1396,6 +2003,10 @@ function hueForName(name) {
     hash = (hash * 31 + name.charCodeAt(index)) % 360;
   }
   return hash;
+}
+
+function formatRate(rate, played) {
+  return played ? `${Math.round(rate * 100)}%` : "–";
 }
 
 function formatDifference(value) {
@@ -1490,6 +2101,20 @@ document.addEventListener("click", (event) => {
     return;
   }
 
+  if (action === "set-games") {
+    const input = document.querySelector("#games-input");
+    if (input) {
+      input.value = button.dataset.games;
+      updateSetupPreview();
+    }
+    return;
+  }
+
+  if (action === "copy-link") {
+    copyShareLink();
+    return;
+  }
+
   if (action === "show-rules") {
     showRulesDialog();
     return;
@@ -1551,7 +2176,7 @@ document.addEventListener("click", (event) => {
     requestAnimationFrame(() => {
       document
         .querySelector(
-          `[data-game-id="${ui.editingGameId}"] [data-score="A"]`
+          `[data-game-id="${CSS.escape(ui.editingGameId)}"] [data-score="A"]`
         )
         ?.focus();
     });
@@ -1560,6 +2185,7 @@ document.addEventListener("click", (event) => {
 
   if (action === "cancel-edit") {
     ui.editingGameId = null;
+    sync.deferred = false;
     renderTournament();
     return;
   }

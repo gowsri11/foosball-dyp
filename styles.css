@@ -2177,6 +2177,231 @@ button svg {
   line-height: 1.55;
 }
 
+/* Equal-games chips and uneven-games warning on the setup form */
+.games-hint:empty {
+  display: none;
+}
+
+.games-hint {
+  margin-top: 4px;
+  margin-bottom: 14px;
+}
+
+.games-hint-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: var(--muted-2);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.games-hint-head small {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: none;
+}
+
+.games-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.games-chip {
+  min-width: 38px;
+  height: 32px;
+  padding: 0 10px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+.games-chip:hover {
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.games-chip.is-active {
+  color: var(--lime-ink);
+  background: var(--lime);
+  border-color: var(--lime);
+}
+
+.games-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  color: var(--orange);
+  background: rgba(255, 171, 107, 0.06);
+  border: 1px solid rgba(255, 171, 107, 0.22);
+  border-radius: var(--radius-md);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.games-warning .preview-icon {
+  color: var(--orange);
+  border-color: rgba(255, 171, 107, 0.22);
+}
+
+.games-warning strong {
+  color: var(--text);
+}
+
+/* Live sync status in the tournament header */
+.sync-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sync-pill::before {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  background: var(--muted-2);
+  border-radius: 50%;
+  content: "";
+}
+
+.sync-pill.is-live {
+  color: var(--lime);
+  border-color: rgba(215, 255, 95, 0.2);
+}
+
+.sync-pill.is-live::before {
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime);
+  animation: sync-pulse 2s ease-in-out infinite;
+}
+
+.sync-pill.is-offline {
+  color: var(--orange);
+  border-color: rgba(255, 171, 107, 0.25);
+}
+
+.sync-pill.is-offline::before {
+  background: var(--orange);
+}
+
+@keyframes sync-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Previous tournaments on the setup page */
+.recent-tournaments {
+  margin-top: 28px;
+}
+
+.recent-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.recent-head small {
+  color: var(--muted-2);
+  font-size: 11px;
+}
+
+.recent-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recent-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 2px 12px;
+  padding: 11px 14px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  text-decoration: none;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease;
+}
+
+.recent-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--line-strong);
+}
+
+.recent-item strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.recent-item span {
+  grid-column: 1;
+  color: var(--muted-2);
+  font-size: 11px;
+}
+
+.recent-item svg {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+}
+
+.loading-main {
+  display: grid;
+  min-height: 60vh;
+  place-items: center;
+}
+
+@media (max-width: 700px) {
+  .sync-pill {
+    width: 30px;
+    padding: 0;
+    justify-content: center;
+    font-size: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-pill.is-live::before {
+    animation: none;
+  }
+}
+
 .busy-overlay {
   position: fixed;
   inset: 0;

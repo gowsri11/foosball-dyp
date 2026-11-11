@@ -1,3 +1,7 @@
 dev-server.mjs
 tests
 node_modules
+scripts
+supabase
+.env
+.env*.local

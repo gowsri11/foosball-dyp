@@ -2,9 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   computeStandings,
+  exactGameCounts,
   generateSchedule,
   getProgress,
   getSchedulePlan,
+  standingsMode,
   validateScore
 } from "../js/scheduler.js";
 
@@ -113,6 +115,85 @@ test("reduces repeated teammates where the field allows fresh pairings", () => {
   assert.equal(result.quality.partner.extra, 0);
 });
 
+function pairCounts(rounds) {
+  const partners = new Map();
+  const opponents = new Map();
+  const key = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+  const bump = (map, a, b) => map.set(key(a, b), (map.get(key(a, b)) || 0) + 1);
+
+  for (const round of rounds) {
+    for (const game of round.games) {
+      bump(partners, ...game.teamA);
+      bump(partners, ...game.teamB);
+      for (const a of game.teamA) {
+        for (const b of game.teamB) {
+          bump(opponents, a, b);
+        }
+      }
+    }
+  }
+
+  return { partners, opponents };
+}
+
+test("6 players x 10 games: every pair teams up twice and faces off four times", () => {
+  const result = generateSchedule(players(6), 10, {
+    rng: seededRandom(2026),
+    attempts: 4
+  });
+  const { partners, opponents } = pairCounts(result.rounds);
+
+  assert.equal(partners.size, 15);
+  assert.equal(opponents.size, 15);
+  assert.ok([...partners.values()].every((count) => count === 2));
+  assert.ok([...opponents.values()].every((count) => count === 4));
+  assert.equal(result.quality.balanced, true);
+  assert.equal(result.quality.partner.min, 2);
+  assert.equal(result.quality.partner.max, 2);
+  assert.equal(result.quality.opponent.min, 4);
+  assert.equal(result.quality.opponent.max, 4);
+});
+
+test("8 players x 7 games: every pair teams up once and faces off twice", () => {
+  const result = generateSchedule(players(8), 7, {
+    rng: seededRandom(77),
+    attempts: 4
+  });
+  const { partners, opponents } = pairCounts(result.rounds);
+
+  assert.equal(partners.size, 28);
+  assert.ok([...partners.values()].every((count) => count === 1));
+  assert.ok([...opponents.values()].every((count) => count === 2));
+  assert.equal(result.quality.balanced, true);
+});
+
+test("balancing keeps every player's game count and the round plan intact", () => {
+  const roster = players(6);
+  const result = generateSchedule(roster, 10, {
+    rng: seededRandom(5),
+    attempts: 2
+  });
+  const appearances = new Map(roster.map((player) => [player.id, 0]));
+
+  for (const round of result.rounds) {
+    const seen = new Set();
+    assert.equal(round.games.length, 1);
+    assert.equal(round.byes.length, 2);
+    for (const game of round.games) {
+      for (const id of [...game.teamA, ...game.teamB]) {
+        assert.ok(!seen.has(id));
+        seen.add(id);
+        appearances.set(id, appearances.get(id) + 1);
+      }
+    }
+    for (const bye of round.byes) {
+      assert.ok(!seen.has(bye));
+    }
+  }
+
+  assert.ok([...appearances.values()].every((count) => count === 10));
+});
+
 test("validates race-to-target scores", () => {
   assert.equal(validateScore(7, 4, 7).valid, true);
   assert.equal(validateScore(4, 7, 7).valid, true);
@@ -160,4 +241,61 @@ test("calculates standings with goal difference as the first tiebreaker", () => 
   assert.equal(table[0].goalDifference, 6);
   assert.equal(table[1].points, 1);
   assert.equal(getProgress(rounds).completed, 2);
+});
+
+test("lists games-per-player values that give everyone equal games", () => {
+  assert.deepEqual(exactGameCounts(6, 10), [2, 4, 6, 8, 10]);
+  assert.deepEqual(exactGameCounts(5, 12), [4, 8, 12]);
+  assert.deepEqual(exactGameCounts(8, 3), [1, 2, 3]);
+  assert.deepEqual(exactGameCounts(3, 10), []);
+});
+
+test("uses points when everyone plays the same number of games", () => {
+  const result = generateSchedule(players(6), 4, { rng: seededRandom(1), attempts: 2 });
+  assert.equal(standingsMode(result.rounds), "points");
+});
+
+test("ranks by win rate, then goal difference per game, when games are uneven", () => {
+  const roster = players(5);
+  const game = (id, teamA, teamB, scoreA, scoreB) => ({ id, teamA, teamB, scoreA, scoreB });
+  // Scheduled games: p1 and p3 play three, p2, p4 and p5 play two.
+  const rounds = [
+    { number: 1, byes: ["p5"], games: [game("g1", ["p1", "p2"], ["p3", "p4"], 7, 5)] },
+    { number: 2, byes: ["p4"], games: [game("g2", ["p1", "p3"], ["p2", "p5"], 7, 6)] },
+    { number: 3, byes: ["p2"], games: [game("g3", ["p1", "p4"], ["p3", "p5"], 0, 7)] },
+    { number: 4, byes: ["p1", "p2", "p3"], games: [] }
+  ];
+  assert.equal(standingsMode(rounds), "winRate");
+
+  const table = computeStandings(roster, rounds);
+  const byId = Object.fromEntries(table.map((row) => [row.id, row]));
+
+  // Win rates: p1 2/3, p3 2/3, p2 1/2, p5 1/2, p4 0/2.
+  assert.equal(byId.p1.points, 2);
+  assert.equal(byId.p1.played, 3);
+  assert.equal(Math.round(byId.p1.winRate * 100), 67);
+  assert.equal(table.at(-1).id, "p4");
+  // p1 and p3 tie on win rate. p3 is +6 over 3 games, p1 is -4 over 3 games.
+  assert.equal(table[0].id, "p3");
+  assert.equal(table[1].id, "p1");
+  assert.ok(table.every((row) => row.mode === "winRate"));
+});
+
+test("a player with an extra game does not outrank a better win rate", () => {
+  const roster = players(5);
+  const game = (id, teamA, teamB, scoreA, scoreB) => ({ id, teamA, teamB, scoreA, scoreB });
+  const rounds = [
+    { number: 1, byes: ["p5"], games: [game("g1", ["p1", "p2"], ["p3", "p4"], 7, 6)] },
+    { number: 2, byes: ["p4"], games: [game("g2", ["p1", "p3"], ["p2", "p5"], 7, 6)] },
+    { number: 3, byes: ["p3"], games: [game("g3", ["p1", "p5"], ["p2", "p4"], 6, 7)] },
+    { number: 4, byes: ["p1", "p2", "p3"], games: [] }
+  ];
+  // p1 wins 2 of 3, p4 wins 1 of 2.
+  const table = computeStandings(roster, rounds);
+  const p1 = table.find((row) => row.id === "p1");
+  const p4 = table.find((row) => row.id === "p4");
+  // On raw points p1 (2) would beat p4 (1). On win rate 67% still beats 50%.
+  assert.ok(p1.rank < p4.rank);
+  // Every player gets a distinct rank, even when win rates tie.
+  assert.equal(new Set(table.map((row) => row.rank)).size, 5);
 });
